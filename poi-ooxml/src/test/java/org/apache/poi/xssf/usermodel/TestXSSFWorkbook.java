@@ -37,6 +37,7 @@ import org.apache.poi.openxml4j.opc.PackageRelationshipCollection;
 import org.apache.poi.openxml4j.opc.PackagingURIHelper;
 import org.apache.poi.openxml4j.opc.ZipPackage;
 import org.apache.poi.openxml4j.opc.internal.FileHelper;
+import org.apache.poi.openxml4j.opc.internal.InvalidZipException;
 import org.apache.poi.openxml4j.opc.internal.MemoryPackagePart;
 import org.apache.poi.openxml4j.opc.internal.PackagePropertiesPart;
 import org.apache.poi.openxml4j.util.ZipInputStreamZipEntrySource;
@@ -82,6 +83,7 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.Date;
@@ -1507,6 +1509,135 @@ public final class TestXSSFWorkbook extends BaseTestXWorkbook {
         } finally {
             assertTrue(tempFile.delete());
         }
+    }
+
+    @Test
+    void testDuplicateFileReadAsOPCFile() {
+        assertThrows(InvalidFormatException.class, () -> {
+            try (OPCPackage pkg = OPCPackage.open(getSampleFile("duplicate-file.xlsx"), PackageAccess.READ)) {
+                // expect exception here
+            }
+        });
+    }
+
+    @Test
+    void testDuplicateFileReadAsFile() {
+        assertThrows(InvalidFormatException.class, () -> {
+            try (XSSFWorkbook wb = new XSSFWorkbook(getSampleFile("duplicate-file.xlsx"))) {
+                // expect exception here
+            }
+        });
+    }
+
+    @Test
+    void testDuplicateFileReadAsStream() {
+        assertThrows(InvalidZipException.class, () -> {
+            try (XSSFWorkbook wb = new XSSFWorkbook(openSampleFileStream("duplicate-file.xlsx"))) {
+                // expect exception here
+            }
+        });
+    }
+
+    @Test
+    void testDuplicateFileDifferentCaseReadAsStream() throws IOException {
+        assertDuplicateSheetEntryRejectedAsStream("XL/Worksheets/Sheet1.xml");
+    }
+
+    @Test
+    void testDuplicateFileDifferentCaseReadAsFile() throws IOException {
+        assertDuplicateSheetEntryRejectedAsFile("XL/Worksheets/Sheet1.xml");
+    }
+
+    @Test
+    void testDuplicateFileMixedSeparatorsReadAsStream() throws IOException {
+        assertDuplicateSheetEntryRejectedAsStream("xl/worksheets\\sheet1.xml");
+    }
+
+    @Test
+    void testDuplicateFileMixedSeparatorsReadAsFile() throws IOException {
+        assertDuplicateSheetEntryRejectedAsFile("xl/worksheets\\sheet1.xml");
+    }
+
+    private static void assertDuplicateSheetEntryRejectedAsStream(String duplicateEntryName) throws IOException {
+        final byte[] data = createXlsxWithDuplicateSheetEntry(duplicateEntryName);
+        InvalidZipException ex = assertThrows(InvalidZipException.class, () -> {
+            try (XSSFWorkbook wb = new XSSFWorkbook(new ByteArrayInputStream(data))) {
+                // expect exception here
+            }
+        });
+        assertEquals("Input file contains more than 1 entry with the name " + duplicateEntryName, ex.getMessage());
+    }
+
+    private static void assertDuplicateSheetEntryRejectedAsFile(String duplicateEntryName) throws IOException {
+        final byte[] data = createXlsxWithDuplicateSheetEntry(duplicateEntryName);
+        final File file = TempFile.createTempFile("duplicate-file", ".xlsx");
+        try {
+            try (OutputStream os = new FileOutputStream(file)) {
+                os.write(data);
+            }
+            InvalidFormatException ex = assertThrows(InvalidFormatException.class, () -> {
+                try (OPCPackage pkg = OPCPackage.open(file, PackageAccess.READ)) {
+                    // expect exception here
+                }
+            });
+            Throwable cause = ex.getCause();
+            assertNotNull(cause);
+            assertTrue(cause.getCause() instanceof InvalidZipException,
+                    "expected the zip entry name check to reject the file, but had " + cause.getCause());
+            assertEquals("Input file contains more than 1 entry with the name " + duplicateEntryName,
+                    cause.getCause().getMessage());
+
+            assertThrows(InvalidFormatException.class, () -> {
+                try (XSSFWorkbook wb = new XSSFWorkbook(file)) {
+                    // expect exception here
+                }
+            });
+        } finally {
+            assertTrue(file.delete());
+        }
+    }
+
+    /**
+     * Creates a valid xlsx and appends a different sheet part, stored under a zip entry name
+     * which only differs from the first sheet in case or path separators
+     */
+    private static byte[] createXlsxWithDuplicateSheetEntry(String duplicateEntryName) throws IOException {
+        final UnsynchronizedByteArrayOutputStream valid = UnsynchronizedByteArrayOutputStream.builder().get();
+        final UnsynchronizedByteArrayOutputStream spoofed = UnsynchronizedByteArrayOutputStream.builder().get();
+        try (XSSFWorkbook wb = new XSSFWorkbook()) {
+            wb.createSheet("Sheet1").createRow(0).createCell(0).setCellValue("original");
+            wb.write(valid);
+        }
+        try (XSSFWorkbook wb = new XSSFWorkbook()) {
+            wb.createSheet("Sheet1").createRow(0).createCell(0).setCellValue(42);
+            wb.write(spoofed);
+        }
+
+        byte[] spoofedSheet = null;
+        try (ZipArchiveInputStream zis = new ZipArchiveInputStream(spoofed.toInputStream())) {
+            ZipArchiveEntry ze;
+            while ((ze = zis.getNextZipEntry()) != null) {
+                if ("xl/worksheets/sheet1.xml".equals(ze.getName())) {
+                    spoofedSheet = IOUtils.toByteArray(zis);
+                }
+            }
+        }
+        assertNotNull(spoofedSheet);
+
+        final UnsynchronizedByteArrayOutputStream bos = UnsynchronizedByteArrayOutputStream.builder().get();
+        try (ZipArchiveInputStream zis = new ZipArchiveInputStream(valid.toInputStream());
+             ZipArchiveOutputStream zos = new ZipArchiveOutputStream(bos)) {
+            ZipArchiveEntry ze;
+            while ((ze = zis.getNextZipEntry()) != null) {
+                zos.putArchiveEntry(new ZipArchiveEntry(ze.getName()));
+                IOUtils.copy(zis, zos);
+                zos.closeArchiveEntry();
+            }
+            zos.putArchiveEntry(new ZipArchiveEntry(duplicateEntryName));
+            zos.write(spoofedSheet);
+            zos.closeArchiveEntry();
+        }
+        return bos.toByteArray();
     }
 
     private static void expectFormattedContent(Cell cell, String value) {
